@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.opentable</groupId>
+    <artifactId>otj-parent-spring</artifactId>
+    <version>160</version>
+  </parent>
+
+  <scm>
+    <connection>scm:git:git://github.com/opentable/jpgbench.git</connection>
+    <developerConnection>scm:git:git@github.com:opentable/jpgbench.git</developerConnection>
+    <url>http://github.com/opentable/jpgbench</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <groupId>com.opentable.bench</groupId>
+  <artifactId>jpgbench</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+
+  <properties>
+    <ot.mainclass>com.opentable.bench.JPgBench</ot.mainclass>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.opentable.components</groupId>
+      <artifactId>otj-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.opentable.components</groupId>
+      <artifactId>otj-logging</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
