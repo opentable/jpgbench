@@ -1,8 +1,8 @@
 package com.opentable.jpgbench;
 
 import java.time.Duration;
+import java.util.Random;
 import java.util.concurrent.Callable;
-import java.util.function.Consumer;
 
 import javax.sql.DataSource;
 
@@ -15,12 +15,16 @@ import org.jdbi.v3.core.Jdbi;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.opentable.function.ThrowingConsumer;
+
 public class JPgBench {
     private static final Logger LOG = LoggerFactory.getLogger(JPgBench.class);
 
-    private final MetricRegistry registry = new MetricRegistry();
-    private final BenchMetrics metrics = new BenchMetrics(registry);
-    long maxAid, maxBid, maxTid;
+    final double scale = 10;
+    final Random r = new Random();
+    final MetricRegistry registry = new MetricRegistry();
+    final BenchMetrics metrics = new BenchMetrics(registry);
+    long maxAid = 10_000, maxBid = 100, maxTid = 1_000;
 
     public static void main(String... args) throws Exception {
         new JPgBench().run(args);
@@ -35,41 +39,65 @@ public class JPgBench {
     }
 
     void run(Jdbi db) throws Exception {
-        db.useTransaction(h -> {
-            maxAid = h.createQuery("SELECT max(aid) FROM pgbench_accounts")
-                .mapTo(int.class).findOnly();
-            maxBid = h.createQuery("SELECT max(bid) FROM pgbench_branches")
-                .mapTo(int.class).findOnly();
-            maxTid = h.createQuery("SELECT max(tid) FROM pgbench_tellers")
-                .mapTo(int.class).findOnly();
-        });
-        LOG.info("Initialized with maxAid={} maxBid={} maxTid={}", maxAid, maxBid, maxTid);
+        LOG.info("Initialized with maxAid={} maxBid={} maxTid={}.  Generating data, please stand by.", maxAid, maxBid, maxTid);
+
+        generateData(db);
 
         final Duration testDuration = Duration.ofSeconds(20);
+        LOG.info("Data created.  Running test of duration {}", testDuration);
+
         final long start = System.nanoTime();
         final BenchOp bench = new BenchOp(this);
         while (System.nanoTime() - start < testDuration.toNanos()) {
             try (final Handle h = metrics.cxn.time(db::open)) {
-                metrics.txn.time(run(() -> bench.accept(h)));
+                metrics.txn.time(run(x -> bench.accept(h)));
             }
         }
 
         ConsoleReporter.forRegistry(registry).build().report();
     }
 
-    private static Callable<Void> run(Runnable r) {
+    private void generateData(Jdbi db) {
+        db.useHandle(h -> {
+            for (String table : new String[] { "pgbench_accounts", "pgbench_branches", "pgbench_history", "pgbench_tellers"}) {
+                h.createUpdate("TRUNCATE TABLE " + table).execute();
+            }
+            for (int bid = 0; bid < maxBid * scale; bid++) {
+                h.createUpdate("INSERT INTO pgbench_branches (bid, bbalance) VALUES (:bid, 0)")
+                    .bind("bid", bid)
+                    .execute();
+            }
+            for (int tid = 0; tid < maxTid * scale; tid++) {
+                h.createUpdate("INSERT INTO pgbench_tellers (tid, bid, tbalance) VALUES (:tid, :bid, 0)")
+                    .bind("tid", tid)
+                    .bind("bid", tid % (maxBid + 1))
+                    .execute();
+            }
+            for (int aid = 0; aid < maxAid * scale; aid++) {
+                h.createUpdate("INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (:aid, :bid, 0, 'xxxxxxxxxxx')")
+                    .bind("aid", aid)
+                    .bind("bid", aid % (maxBid + 1))
+                    .execute();
+            }
+        });
+    }
+
+    private static Callable<Void> run(ThrowingConsumer<Void> r) {
         return () -> {
-            r.run();
+            r.accept(null);
             return null;
         };
     }
 }
 
 class BenchMetrics {
-    final Timer cxn, txn;
+    final Timer cxn, txn, begin, stmt, commit;
     BenchMetrics(MetricRegistry registry) {
         cxn = registry.timer("cxn");
         txn = registry.timer("txn");
+        begin = registry.timer("begin");
+        stmt = registry.timer("stmt");
+        commit = registry.timer("commit");
     }
 }
 
@@ -87,7 +115,7 @@ class BenchMetrics {
 //"INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);\n"
 //"END;\n"
 
-class BenchOp implements Consumer<Handle> {
+class BenchOp implements ThrowingConsumer<Handle> {
     private final JPgBench bench;
 
     BenchOp(JPgBench bench) {
@@ -95,12 +123,41 @@ class BenchOp implements Consumer<Handle> {
     }
 
     @Override
-    public void accept(Handle h) {
-        h.begin();
+    public void accept(Handle h) throws Exception {
+        final int delta = bench.r.nextInt(10000) - 5000;
+        final long aid = bench.r.longs(0, bench.maxAid + 1).findAny().getAsLong();
+        final long bid = bench.r.longs(0, bench.maxBid + 1).findAny().getAsLong();
+        final long tid = bench.r.longs(0, bench.maxTid + 1).findAny().getAsLong();
         try {
-
-        } finally {
-
+            bench.metrics.begin.time(h::begin);
+            try (Timer.Context stmtTime = bench.metrics.stmt.time()) {
+                h.createUpdate("UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid")
+                    .bind("aid", aid)
+                    .bind("delta", delta)
+                    .execute();
+                h.createQuery("SELECT abalance FROM pgbench_accounts WHERE aid = :aid")
+                    .bind("aid", aid)
+                    .mapTo(long.class)
+                    .findOnly();
+                h.createUpdate("UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid")
+                    .bind("tid", tid)
+                    .bind("delta", delta)
+                    .execute();
+                h.createUpdate("UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid")
+                    .bind("bid", bid)
+                    .bind("delta", delta)
+                    .execute();
+                h.createUpdate("INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP)")
+                    .bind("tid", tid)
+                    .bind("bid", bid)
+                    .bind("aid", aid)
+                    .bind("delta", delta)
+                    .execute();
+            }
+            bench.metrics.commit.time(h::commit);
+        } catch (Exception e) {
+            h.rollback();
+            throw e;
         }
     }
 }
