@@ -1,5 +1,9 @@
 package com.opentable.jpgbench;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.time.Duration;
+
 import org.junit.Rule;
 import org.junit.Test;
 
@@ -13,6 +17,8 @@ public class TestJPgBench {
 
     @Test
     public void test() throws Exception {
-        new JPgBench().run(pg.getTestDatabase());
+        final JPgBench bench = new JPgBench();
+        bench.testDuration = Duration.ofSeconds(2);
+        assertThat(bench.run(pg.getTestDatabase())).isGreaterThan(10);
     }
 }

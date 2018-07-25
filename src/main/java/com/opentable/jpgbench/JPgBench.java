@@ -6,8 +6,8 @@ import java.util.concurrent.Callable;
 
 import javax.sql.DataSource;
 
-import com.codahale.metrics.ConsoleReporter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Snapshot;
 import com.codahale.metrics.Timer;
 
 import org.jdbi.v3.core.Handle;
@@ -20,6 +20,7 @@ import com.opentable.function.ThrowingConsumer;
 public class JPgBench {
     private static final Logger LOG = LoggerFactory.getLogger(JPgBench.class);
 
+    Duration testDuration = Duration.ofSeconds(20);
     final double scale = 10;
     final Random r = new Random();
     final MetricRegistry registry = new MetricRegistry();
@@ -30,20 +31,19 @@ public class JPgBench {
         new JPgBench().run(args);
     }
 
-    void run(String... args) throws Exception {
-        run(Jdbi.create("XXX"));
+    long run(String... args) throws Exception {
+        return run(Jdbi.create("XXX"));
     }
 
-    void run(DataSource ds) throws Exception {
-        run(Jdbi.create(ds));
+    long run(DataSource ds) throws Exception {
+        return run(Jdbi.create(ds));
     }
 
-    void run(Jdbi db) throws Exception {
+    long run(Jdbi db) throws Exception {
         LOG.info("Initialized with maxAid={} maxBid={} maxTid={}.  Generating data, please stand by.", maxAid, maxBid, maxTid);
 
         generateData(db);
 
-        final Duration testDuration = Duration.ofSeconds(20);
         LOG.info("Data created.  Running test of duration {}", testDuration);
 
         final long start = System.nanoTime();
@@ -54,7 +54,15 @@ public class JPgBench {
             }
         }
 
-        ConsoleReporter.forRegistry(registry).build().report();
+        final StringBuilder report = new StringBuilder();
+        report.append("==== Run Complete!\nn = " + metrics.txn.getCount() + " [50/95/99us]\n");
+        for (String t : new String[] { "cxn", "txn", "begin", "stmt", "commit" }) {
+            final Snapshot s = registry.getTimers().get(t).getSnapshot();
+            report.append(String.format("%6s = [%8.2f/%8.2f/%8.2f]\n", t,
+                    s.getMedian() / 1000.0, s.get95thPercentile() / 1000.0, s.get99thPercentile() / 1000.0));
+        }
+        LOG.info("{}", report);
+        return metrics.txn.getCount();
     }
 
     private void generateData(Jdbi db) {
