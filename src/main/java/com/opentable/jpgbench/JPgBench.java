@@ -1,6 +1,7 @@
 package com.opentable.jpgbench;
 
 import java.time.Duration;
+import java.util.concurrent.Callable;
 import java.util.function.Consumer;
 
 import javax.sql.DataSource;
@@ -46,13 +47,21 @@ public class JPgBench {
 
         final Duration testDuration = Duration.ofSeconds(20);
         final long start = System.nanoTime();
+        final BenchOp bench = new BenchOp(this);
         while (System.nanoTime() - start < testDuration.toNanos()) {
             try (final Handle h = metrics.cxn.time(db::open)) {
-
+                metrics.txn.time(run(() -> bench.accept(h)));
             }
         }
 
         ConsoleReporter.forRegistry(registry).build().report();
+    }
+
+    private static Callable<Void> run(Runnable r) {
+        return () -> {
+            r.run();
+            return null;
+        };
     }
 }
 
