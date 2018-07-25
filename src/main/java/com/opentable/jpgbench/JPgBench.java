@@ -1,7 +1,9 @@
-package com.opentable.bench;
+package com.opentable.jpgbench;
 
 import java.time.Duration;
 import java.util.function.Consumer;
+
+import javax.sql.DataSource;
 
 import com.codahale.metrics.ConsoleReporter;
 import com.codahale.metrics.MetricRegistry;
@@ -24,7 +26,14 @@ public class JPgBench {
     }
 
     void run(String... args) throws Exception {
-        final Jdbi db = Jdbi.create("XXX");
+        run(Jdbi.create("XXX"));
+    }
+
+    void run(DataSource ds) throws Exception {
+        run(Jdbi.create(ds));
+    }
+
+    void run(Jdbi db) throws Exception {
         db.useTransaction(h -> {
             maxAid = h.createQuery("SELECT max(aid) FROM pgbench_accounts")
                 .mapTo(int.class).findOnly();
