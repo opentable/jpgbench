@@ -12,6 +12,7 @@ import com.codahale.metrics.Timer;
 
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.PreparedBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -58,7 +59,7 @@ public class JPgBench {
         report.append("==== Run Complete!\nn = " + metrics.txn.getCount() + " [50/95/99us]\n");
         for (String t : new String[] { "cxn", "txn", "begin", "stmt", "commit" }) {
             final Snapshot s = registry.getTimers().get(t).getSnapshot();
-            report.append(String.format("%6s = [%8.2f/%8.2f/%8.2f]\n", t,
+            report.append(String.format("%6s = [%10.2f/%10.2f/%10.2f]\n", t,
                     s.getMedian() / 1000.0, s.get95thPercentile() / 1000.0, s.get99thPercentile() / 1000.0));
         }
         LOG.info("{}", report);
@@ -70,22 +71,31 @@ public class JPgBench {
             for (String table : new String[] { "pgbench_accounts", "pgbench_branches", "pgbench_history", "pgbench_tellers"}) {
                 h.createUpdate("TRUNCATE TABLE " + table).execute();
             }
+            final PreparedBatch bs = h.prepareBatch("INSERT INTO pgbench_branches (bid, bbalance) VALUES (:bid, 0)");
             for (int bid = 0; bid < maxBid * scale; bid++) {
-                h.createUpdate("INSERT INTO pgbench_branches (bid, bbalance) VALUES (:bid, 0)")
-                    .bind("bid", bid)
-                    .execute();
+                    bs.bind("bid", bid).add();
             }
+            bs.execute();
+            final PreparedBatch ts = h.prepareBatch("INSERT INTO pgbench_tellers (tid, bid, tbalance) VALUES (:tid, :bid, 0)");
             for (int tid = 0; tid < maxTid * scale; tid++) {
-                h.createUpdate("INSERT INTO pgbench_tellers (tid, bid, tbalance) VALUES (:tid, :bid, 0)")
-                    .bind("tid", tid)
+                ts  .bind("tid", tid)
                     .bind("bid", tid % (maxBid + 1))
-                    .execute();
+                    .add();
             }
+            ts.execute();
+            PreparedBatch batch = null;
             for (int aid = 0; aid < maxAid * scale; aid++) {
-                h.createUpdate("INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (:aid, :bid, 0, 'xxxxxxxxxxx')")
-                    .bind("aid", aid)
+                if (batch == null) {
+                    batch = h.prepareBatch("INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (:aid, :bid, 0, 'xxxxxxxxxxx')");
+                }
+                batch.bind("aid", aid)
                     .bind("bid", aid % (maxBid + 1))
-                    .execute();
+                    .add();
+                if (batch.size() > 10_000) {
+                    LOG.info("Wrote {} of {} rows", aid, maxAid * scale);
+                    batch.execute();
+                    batch = null;
+                }
             }
         });
     }
