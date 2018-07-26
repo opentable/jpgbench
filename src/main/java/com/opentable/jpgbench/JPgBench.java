@@ -3,6 +3,7 @@ package com.opentable.jpgbench;
 import java.time.Duration;
 import java.util.Random;
 import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
 
 import javax.sql.DataSource;
 
@@ -54,6 +55,7 @@ public class JPgBench {
                 metrics.txn.time(run(x -> bench.accept(h)));
             }
         }
+        final long end = System.nanoTime();
 
         final StringBuilder report = new StringBuilder();
         report.append("==== Run Complete!\nn = " + metrics.txn.getCount() + " [50/95/99us]\n");
@@ -62,6 +64,8 @@ public class JPgBench {
             report.append(String.format("%6s = [%10.2f/%10.2f/%10.2f]\n", t,
                     s.getMedian() / 1000.0, s.get95thPercentile() / 1000.0, s.get99thPercentile() / 1000.0));
         }
+        final double tps = 1.0 * metrics.txn.getCount() / ((end - start) / TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS));
+        report.append(String.format("tps=%.2f tpm=%.2f\n", tps, tps * 60));
         LOG.info("{}", report);
         return metrics.txn.getCount();
     }
@@ -91,7 +95,7 @@ public class JPgBench {
                 batch.bind("aid", aid)
                     .bind("bid", aid % (maxBid + 1))
                     .add();
-                if (batch.size() > 10_000) {
+                if (batch.size() >= 10_000) {
                     LOG.info("Wrote {} of {} rows", aid, maxAid * scale);
                     batch.execute();
                     batch = null;
