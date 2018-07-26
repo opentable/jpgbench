@@ -11,6 +11,12 @@ import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Snapshot;
 import com.codahale.metrics.Timer;
 
+import net.sourceforge.argparse4j.ArgumentParsers;
+import net.sourceforge.argparse4j.impl.action.StoreTrueArgumentAction;
+import net.sourceforge.argparse4j.inf.Argument;
+import net.sourceforge.argparse4j.inf.ArgumentParser;
+import net.sourceforge.argparse4j.inf.Namespace;
+
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.core.statement.PreparedBatch;
@@ -23,17 +29,40 @@ public class JPgBench {
     private static final Logger LOG = LoggerFactory.getLogger(JPgBench.class);
 
     Duration testDuration = Duration.ofSeconds(20);
-    final double scale = 10;
+    boolean initOnly = false;
+    int concurrency = 1;
+    int scale = 10;
     final Random r = new Random();
     final MetricRegistry registry = new MetricRegistry();
     final BenchMetrics metrics = new BenchMetrics(registry);
-    long maxAid = 10_000, maxBid = 100, maxTid = 1_000;
+    long maxAid = 100_000, maxBid = 1, maxTid = 10;
 
     public static void main(String... args) throws Exception {
         new JPgBench().run(args);
     }
 
     long run(String... args) throws Exception {
+        final ArgumentParser parser = ArgumentParsers.newFor("jpgbench")
+                .build()
+                .description("JPgBench is a small Java Postgres benchmark in the style of PgBench");
+        final Argument initialize = parser.addArgument("-i", "--initialize")
+                .help("Only initialize the tables, don't run the test")
+                .type(boolean.class)
+                .action(new StoreTrueArgumentAction());
+        final Argument scale = parser.addArgument("-s", "--scale")
+                .help("Scale the size of the test dataset")
+                .type(int.class)
+                .setDefault(10);
+        final Argument concurrency = parser.addArgument("-c", "--client")
+                .help("Number of concurrent clients to run")
+                .type(int.class)
+                .setDefault(1);
+        final Namespace parsed = parser.parseArgsOrFail(args);
+
+        this.initOnly = parsed.getBoolean(initialize.getDest());
+        this.scale = parsed.getInt(scale.getDest());
+        this.concurrency = parsed.getInt(concurrency.getDest());
+
         return run(Jdbi.create("XXX"));
     }
 
