@@ -1,15 +1,23 @@
 package com.opentable.jpgbench;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Random;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 
 import javax.sql.DataSource;
 
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Snapshot;
 import com.codahale.metrics.Timer;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.impl.action.StoreTrueArgumentAction;
@@ -17,9 +25,12 @@ import net.sourceforge.argparse4j.inf.Argument;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
 import net.sourceforge.argparse4j.inf.Namespace;
 
+import org.apache.commons.lang3.StringUtils;
 import org.jdbi.v3.core.Handle;
+import org.jdbi.v3.core.HandleConsumer;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.core.statement.PreparedBatch;
+import org.postgresql.ds.PGSimpleDataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,10 +44,12 @@ public class JPgBench {
     boolean rerun = false;
     int concurrency = 1;
     int scale = 10;
+    ConnectStrategy connectStrategy;
     final Random r = new Random();
     final MetricRegistry registry = new MetricRegistry();
     final BenchMetrics metrics = new BenchMetrics(registry);
     long maxAid = 100_000, maxBid = 1, maxTid = 10;
+
 
     public static void main(String... args) throws Exception {
         new JPgBench().run(args);
@@ -62,21 +75,49 @@ public class JPgBench {
                 .help("Number of concurrent clients to run")
                 .type(int.class)
                 .setDefault(1);
+        final Argument connectStrategy = parser.addArgument("-C", "--connect")
+                .help("Strategy to acquire connections")
+                .type(ConnectStrategy.class)
+                .setDefault(ConnectStrategy.DIRECT);
+        final Argument jdbcUri = parser.addArgument("jdbcUri")
+                .required(true)
+                .help("The JDBC uri to connect to");
+
         final Namespace parsed = parser.parseArgsOrFail(args);
 
         this.initOnly = parsed.getBoolean(initialize.getDest());
         this.rerun = parsed.getBoolean(rerun.getDest());
         this.scale = parsed.getInt(scale.getDest());
         this.concurrency = parsed.getInt(concurrency.getDest());
+        this.connectStrategy = parsed.get(connectStrategy.getDest());
 
-        return run(Jdbi.create("XXX"));
+        final PGSimpleDataSource ds = new PGSimpleDataSource();
+        ds.setUrl(parsed.getString(jdbcUri.getDest()));
+        if (StringUtils.isBlank(ds.getPassword())) {
+            findPgpass(ds);
+        }
+        return run(this.connectStrategy.apply(ds));
+    }
+
+    private void findPgpass(PGSimpleDataSource ds) throws IOException {
+        Files.lines(Paths.get(System.getProperty("user.home"), ".pgpass"))
+            .map(l -> StringUtils.split(l, ':'))
+            .filter(p ->
+                    (p[0].equals("*") || p[0].equals(ds.getServerName())) &&
+                    (p[1].equals("*") || Integer.parseInt(p[1]) == ds.getPortNumber()) &&
+                    (p[2].equals("*") || p[2].equals(ds.getDatabaseName())) &&
+                    (p[3].equals("*") || p[3].equals(ds.getUser()))
+                )
+            .map(p -> p[4])
+            .findFirst()
+            .ifPresent(ds::setPassword);
     }
 
     long run(DataSource ds) throws Exception {
-        return run(Jdbi.create(ds));
+        return run(this.connectStrategy.apply(ds));
     }
 
-    long run(Jdbi db) throws Exception {
+    long run(HandleSupplier db) throws Exception {
         LOG.info("Initialized with maxAid={} maxBid={} maxTid={}.  Generating data, please stand by.", maxAid, maxBid, maxTid);
 
         if (rerun) {
@@ -96,8 +137,11 @@ public class JPgBench {
         final long start = System.nanoTime();
         final BenchOp bench = new BenchOp(this);
         while (System.nanoTime() - start < testDuration.toNanos()) {
-            try (final Handle h = metrics.cxn.time(db::open)) {
+            final Handle h = metrics.cxn.time(db::get);
+            try {
                 metrics.txn.time(run(x -> bench.accept(h)));
+            } finally {
+                db.close(h);
             }
         }
         final long end = System.nanoTime();
@@ -115,7 +159,7 @@ public class JPgBench {
         return metrics.txn.getCount();
     }
 
-    private void generateData(Jdbi db) {
+    private void generateData(HandleSupplier db) {
         db.useHandle(h -> {
             for (String table : new String[] { "pgbench_accounts", "pgbench_branches", "pgbench_history", "pgbench_tellers"}) {
                 h.createUpdate("TRUNCATE TABLE " + table).execute();
@@ -125,6 +169,7 @@ public class JPgBench {
                     bs.bind("bid", bid).add();
             }
             bs.execute();
+            bs.close();
             final PreparedBatch ts = h.prepareBatch("INSERT INTO pgbench_tellers (tid, bid, tbalance) VALUES (:tid, :bid, 0)");
             for (int tid = 0; tid < maxTid * scale; tid++) {
                 ts  .bind("tid", tid)
@@ -132,6 +177,7 @@ public class JPgBench {
                     .add();
             }
             ts.execute();
+            ts.close();
             PreparedBatch batch = null;
             for (int aid = 0; aid < maxAid * scale; aid++) {
                 if (batch == null) {
@@ -141,10 +187,15 @@ public class JPgBench {
                     .bind("bid", aid % (maxBid + 1))
                     .add();
                 if (batch.size() >= 10_000) {
-                    LOG.info("Wrote {} of {} rows", aid, maxAid * scale);
+                    LOG.info("Wrote {} of {} rows", aid + 1, maxAid * scale);
                     batch.execute();
+                    batch.close();
                     batch = null;
                 }
+            }
+            if (batch != null) {
+                batch.execute();
+                batch.close();
             }
         });
     }
@@ -226,5 +277,64 @@ class BenchOp implements ThrowingConsumer<Handle> {
             h.rollback();
             throw e;
         }
+    }
+}
+
+enum ConnectStrategy {
+    DIRECT {
+        @Override
+        HandleSupplier apply(DataSource ds) {
+            return Jdbi.create(ds)::open;
+        }
+    },
+    ONCE {
+        @Override
+        HandleSupplier apply(DataSource ds) {
+            final Connection c;
+            try {
+                c = ds.getConnection();
+            } catch (SQLException e) {
+                throw new IllegalStateException(e);
+            }
+            final Handle h = Jdbi.create(() -> c).open();
+            return new HandleSupplier() {
+                @Override
+                public Handle get() {
+                    return h;
+                }
+                @Override
+                public void close(Handle h) {
+                    // noop
+                }
+            };
+        }
+    },
+    HIKARI {
+        @SuppressWarnings("resource")
+        @Override
+        HandleSupplier apply(DataSource ds) {
+            final HikariConfig config = new HikariConfig();
+            config.setDataSource(ds);
+            config.setMaximumPoolSize(1);
+
+            return Jdbi.create(new HikariDataSource(config))::open;
+        }
+    };
+
+    abstract HandleSupplier apply(DataSource ds);
+}
+
+interface HandleSupplier extends Supplier<Handle> {
+    default <X extends Exception> void useHandle(HandleConsumer<X> consumer) throws X {
+        Handle h = get();
+        try {
+            consumer.useHandle(h);
+        } finally {
+            close(h);
+        }
+    }
+
+    default void close(Handle h) {
+        h.close();
     }
 }
