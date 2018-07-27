@@ -30,6 +30,7 @@ public class JPgBench {
 
     Duration testDuration = Duration.ofSeconds(20);
     boolean initOnly = false;
+    boolean rerun = false;
     int concurrency = 1;
     int scale = 10;
     final Random r = new Random();
@@ -49,6 +50,10 @@ public class JPgBench {
                 .help("Only initialize the tables, don't run the test")
                 .type(boolean.class)
                 .action(new StoreTrueArgumentAction());
+        final Argument rerun = parser.addArgument("-r", "--rerun")
+                .help("Rerun the test without setting up the data again, only truncate history")
+                .type(boolean.class)
+                .action(new StoreTrueArgumentAction());
         final Argument scale = parser.addArgument("-s", "--scale")
                 .help("Scale the size of the test dataset")
                 .type(int.class)
@@ -60,6 +65,7 @@ public class JPgBench {
         final Namespace parsed = parser.parseArgsOrFail(args);
 
         this.initOnly = parsed.getBoolean(initialize.getDest());
+        this.rerun = parsed.getBoolean(rerun.getDest());
         this.scale = parsed.getInt(scale.getDest());
         this.concurrency = parsed.getInt(concurrency.getDest());
 
@@ -73,7 +79,17 @@ public class JPgBench {
     long run(Jdbi db) throws Exception {
         LOG.info("Initialized with maxAid={} maxBid={} maxTid={}.  Generating data, please stand by.", maxAid, maxBid, maxTid);
 
-        generateData(db);
+        if (rerun) {
+            db.useHandle(h -> {
+                h.createUpdate("TRUNCATE TABLE pgbench_history").execute();
+            });
+        } else {
+            generateData(db);
+        }
+
+        if (initOnly) {
+            return 0;
+        }
 
         LOG.info("Data created.  Running test of duration {}", testDuration);
 
