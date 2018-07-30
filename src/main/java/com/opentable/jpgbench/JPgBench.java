@@ -7,8 +7,13 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Random;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import javax.sql.DataSource;
@@ -16,6 +21,7 @@ import javax.sql.DataSource;
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Snapshot;
 import com.codahale.metrics.Timer;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
@@ -42,6 +48,7 @@ public class JPgBench {
     Duration testDuration = Duration.ofSeconds(20);
     boolean initOnly = false;
     boolean rerun = false;
+    boolean failure = false;
     int concurrency = 1;
     int scale = 10;
     ConnectStrategy connectStrategy;
@@ -52,7 +59,9 @@ public class JPgBench {
 
 
     public static void main(String... args) throws Exception {
-        new JPgBench().run(args);
+        if (new JPgBench().run(args) < 0) {
+            System.exit(1);
+        }
     }
 
     long run(String... args) throws Exception {
@@ -96,7 +105,7 @@ public class JPgBench {
         if (StringUtils.isBlank(ds.getPassword())) {
             findPgpass(ds);
         }
-        return run(this.connectStrategy.apply(ds));
+        return run(this.connectStrategy.apply(this, ds));
     }
 
     private void findPgpass(PGSimpleDataSource ds) throws IOException {
@@ -114,7 +123,7 @@ public class JPgBench {
     }
 
     long run(DataSource ds) throws Exception {
-        return run(this.connectStrategy.apply(ds));
+        return run(this.connectStrategy.apply(this, ds));
     }
 
     long run(HandleSupplier db) throws Exception {
@@ -134,16 +143,49 @@ public class JPgBench {
 
         LOG.info("Data created.  Running test of duration {}", testDuration);
 
-        final long start = System.nanoTime();
+        final AtomicLong start = new AtomicLong(-1);
+        final CountDownLatch startingGate = new CountDownLatch(1);
         final BenchOp bench = new BenchOp(this);
-        while (System.nanoTime() - start < testDuration.toNanos()) {
-            final Handle h = metrics.cxn.time(db::get);
-            try {
-                metrics.txn.time(run(x -> bench.accept(h)));
-            } finally {
-                db.close(h);
-            }
+        final ExecutorService clientPool = new ThreadPoolExecutor(
+                concurrency, concurrency,
+                1, TimeUnit.DAYS,
+                new ArrayBlockingQueue<>(100),
+                new ThreadFactoryBuilder().setNameFormat("jdbi-client-%d").build());
+        for (int i = 0; i < concurrency; i++) {
+            clientPool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    final Handle warmup = db.get();
+                    try {
+                        startingGate.countDown();
+                        startingGate.await(1, TimeUnit.MINUTES);
+                        if (start.compareAndSet(-1, System.nanoTime())) {
+                            LOG.info("Launched {} threads.", concurrency);
+                        }
+                        db.close(warmup);
+                    } catch (InterruptedException e) {
+                        LOG.warn("while awaiting start", e);
+                    }
+                    while (System.nanoTime() - start.get() < testDuration.toNanos()) {
+                        Handle h = null;
+                        try {
+                            h = metrics.cxn.time(db::get);
+                            final Handle lh = h;
+                            metrics.txn.time(voidize(x -> bench.accept(lh)));
+                        } catch (Exception e) {
+                            failure = true;
+                            LOG.warn("during test run", e);
+                        } finally {
+                            if (h != null) {
+                                db.close(h);
+                            }
+                        }
+                    }
+                }
+            });
         }
+        clientPool.shutdown();
+        clientPool.awaitTermination(testDuration.toMillis() + 5_000, TimeUnit.MILLISECONDS);
         final long end = System.nanoTime();
 
         final StringBuilder report = new StringBuilder();
@@ -153,10 +195,10 @@ public class JPgBench {
             report.append(String.format("%6s = [%10.2f/%10.2f/%10.2f]\n", t,
                     s.getMedian() / 1000.0, s.get95thPercentile() / 1000.0, s.get99thPercentile() / 1000.0));
         }
-        final double tps = 1.0 * metrics.txn.getCount() / ((end - start) / TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS));
+        final double tps = 1.0 * metrics.txn.getCount() / ((end - start.get()) / TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS));
         report.append(String.format("tps=%.2f tpm=%.2f\n", tps, tps * 60));
         LOG.info("{}", report);
-        return metrics.txn.getCount();
+        return failure ? -1 : metrics.txn.getCount();
     }
 
     private void generateData(HandleSupplier db) {
@@ -166,7 +208,7 @@ public class JPgBench {
             }
             final PreparedBatch bs = h.prepareBatch("INSERT INTO pgbench_branches (bid, bbalance) VALUES (:bid, 0)");
             for (int bid = 0; bid < maxBid * scale; bid++) {
-                    bs.bind("bid", bid).add();
+                bs.bind("bid", bid).add();
             }
             bs.execute();
             bs.close();
@@ -200,7 +242,7 @@ public class JPgBench {
         });
     }
 
-    private static Callable<Void> run(ThrowingConsumer<Void> r) {
+    static Callable<Void> voidize(ThrowingConsumer<Void> r) {
         return () -> {
             r.accept(null);
             return null;
@@ -283,13 +325,13 @@ class BenchOp implements ThrowingConsumer<Handle> {
 enum ConnectStrategy {
     DIRECT {
         @Override
-        HandleSupplier apply(DataSource ds) {
+        HandleSupplier apply(JPgBench bench, DataSource ds) {
             return Jdbi.create(ds)::open;
         }
     },
     ONCE {
         @Override
-        HandleSupplier apply(DataSource ds) {
+        HandleSupplier apply(JPgBench bench, DataSource ds) {
             final Connection c;
             try {
                 c = ds.getConnection();
@@ -312,16 +354,17 @@ enum ConnectStrategy {
     HIKARI {
         @SuppressWarnings("resource")
         @Override
-        HandleSupplier apply(DataSource ds) {
+        HandleSupplier apply(JPgBench bench, DataSource ds) {
             final HikariConfig config = new HikariConfig();
             config.setDataSource(ds);
-            config.setMaximumPoolSize(1);
+            config.setMaximumPoolSize(bench.concurrency);
 
-            return Jdbi.create(new HikariDataSource(config))::open;
+            final HikariDataSource h = new HikariDataSource(config);
+            return Jdbi.create(h)::open;
         }
     };
 
-    abstract HandleSupplier apply(DataSource ds);
+    abstract HandleSupplier apply(JPgBench bench, DataSource ds);
 }
 
 interface HandleSupplier extends Supplier<Handle> {
