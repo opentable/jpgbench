@@ -28,15 +28,21 @@
       <groupId>com.opentable.components</groupId>
       <artifactId>otj-core</artifactId>
     </dependency>
+
     <dependency>
-      <groupId>com.opentable.components</groupId>
-      <artifactId>otj-logging</artifactId>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
     </dependency>
 
     <dependency>
       <groupId>net.sourceforge.argparse4j</groupId>
       <artifactId>argparse4j</artifactId>
       <version>0.8.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
     </dependency>
 
     <dependency>

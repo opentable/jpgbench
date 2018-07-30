@@ -1,5 +1,10 @@
 package com.opentable.jpgbench;
 
+import static com.opentable.jpgbench.JPgBench.AID;
+import static com.opentable.jpgbench.JPgBench.BID;
+import static com.opentable.jpgbench.JPgBench.DELTA;
+import static com.opentable.jpgbench.JPgBench.TID;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -43,6 +48,11 @@ import org.slf4j.LoggerFactory;
 import com.opentable.function.ThrowingConsumer;
 
 public class JPgBench {
+    static final String BID = "bid";
+    static final String AID = "aid";
+    static final String TID = "tid";
+    static final String DELTA = "delta";
+
     private static final Logger LOG = LoggerFactory.getLogger(JPgBench.class);
 
     Duration testDuration = Duration.ofSeconds(20);
@@ -51,7 +61,7 @@ public class JPgBench {
     boolean failure = false;
     int concurrency = 1;
     int scale = 10;
-    ConnectStrategy connectStrategy;
+    ConnectStrategy connectStrategy = ConnectStrategy.DIRECT;
     final Random r = new Random();
     final MetricRegistry registry = new MetricRegistry();
     final BenchMetrics metrics = new BenchMetrics(registry);
@@ -60,7 +70,7 @@ public class JPgBench {
 
     public static void main(String... args) throws Exception {
         if (new JPgBench().run(args) < 0) {
-            System.exit(1);
+            System.exit(1); // NOPMD
         }
     }
 
@@ -158,7 +168,9 @@ public class JPgBench {
                     final Handle warmup = db.get();
                     try {
                         startingGate.countDown();
-                        startingGate.await(1, TimeUnit.MINUTES);
+                        if (!startingGate.await(1, TimeUnit.MINUTES)) {
+                            throw new IllegalStateException("didn't await");
+                        }
                         if (start.compareAndSet(-1, System.nanoTime())) {
                             LOG.info("Launched {} threads.", concurrency);
                         }
@@ -188,15 +200,15 @@ public class JPgBench {
         clientPool.awaitTermination(testDuration.toMillis() + 5_000, TimeUnit.MILLISECONDS);
         final long end = System.nanoTime();
 
-        final StringBuilder report = new StringBuilder();
+        final StringBuilder report = new StringBuilder(128);
         report.append("==== Run Complete!\nn = " + metrics.txn.getCount() + " [50/95/99us]\n");
         for (String t : new String[] { "cxn", "txn", "begin", "stmt", "commit" }) {
             final Snapshot s = registry.getTimers().get(t).getSnapshot();
-            report.append(String.format("%6s = [%10.2f/%10.2f/%10.2f]\n", t,
+            report.append(String.format("%6s = [%10.2f/%10.2f/%10.2f]%n", t,
                     s.getMedian() / 1000.0, s.get95thPercentile() / 1000.0, s.get99thPercentile() / 1000.0));
         }
-        final double tps = 1.0 * metrics.txn.getCount() / ((end - start.get()) / TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS));
-        report.append(String.format("tps=%.2f tpm=%.2f\n", tps, tps * 60));
+        final double tps = metrics.txn.getCount() / ((1.0d * end - start.get()) / TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS));
+        report.append(String.format("tps=%.2f tpm=%.2f%n", tps, tps * 60));
         LOG.info("{}", report);
         return failure ? -1 : metrics.txn.getCount();
     }
@@ -208,14 +220,14 @@ public class JPgBench {
             }
             final PreparedBatch bs = h.prepareBatch("INSERT INTO pgbench_branches (bid, bbalance) VALUES (:bid, 0)");
             for (int bid = 0; bid < maxBid * scale; bid++) {
-                bs.bind("bid", bid).add();
+                bs.bind(BID, bid).add();
             }
             bs.execute();
             bs.close();
             final PreparedBatch ts = h.prepareBatch("INSERT INTO pgbench_tellers (tid, bid, tbalance) VALUES (:tid, :bid, 0)");
             for (int tid = 0; tid < maxTid * scale; tid++) {
-                ts  .bind("tid", tid)
-                    .bind("bid", tid % (maxBid + 1))
+                ts  .bind(TID, tid)
+                    .bind(BID, tid % (maxBid + 1))
                     .add();
             }
             ts.execute();
@@ -225,8 +237,8 @@ public class JPgBench {
                 if (batch == null) {
                     batch = h.prepareBatch("INSERT INTO pgbench_accounts (aid, bid, abalance, filler) VALUES (:aid, :bid, 0, 'xxxxxxxxxxx')");
                 }
-                batch.bind("aid", aid)
-                    .bind("bid", aid % (maxBid + 1))
+                batch.bind(AID, aid)
+                    .bind(BID, aid % (maxBid + 1))
                     .add();
                 if (batch.size() >= 10_000) {
                     LOG.info("Wrote {} of {} rows", aid + 1, maxAid * scale);
@@ -292,26 +304,26 @@ class BenchOp implements ThrowingConsumer<Handle> {
             bench.metrics.begin.time(h::begin);
             try (Timer.Context stmtTime = bench.metrics.stmt.time()) {
                 h.createUpdate("UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid")
-                    .bind("aid", aid)
-                    .bind("delta", delta)
+                    .bind(AID, aid)
+                    .bind(DELTA, delta)
                     .execute();
                 h.createQuery("SELECT abalance FROM pgbench_accounts WHERE aid = :aid")
-                    .bind("aid", aid)
+                    .bind(AID, aid)
                     .mapTo(long.class)
                     .findOnly();
                 h.createUpdate("UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid")
-                    .bind("tid", tid)
-                    .bind("delta", delta)
+                    .bind(TID, tid)
+                    .bind(DELTA, delta)
                     .execute();
                 h.createUpdate("UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid")
-                    .bind("bid", bid)
-                    .bind("delta", delta)
+                    .bind(BID, bid)
+                    .bind(DELTA, delta)
                     .execute();
                 h.createUpdate("INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP)")
-                    .bind("tid", tid)
-                    .bind("bid", bid)
-                    .bind("aid", aid)
-                    .bind("delta", delta)
+                    .bind(TID, tid)
+                    .bind(BID, bid)
+                    .bind(AID, aid)
+                    .bind(DELTA, delta)
                     .execute();
             }
             bench.metrics.commit.time(h::commit);
@@ -332,7 +344,7 @@ enum ConnectStrategy {
     ONCE {
         @Override
         HandleSupplier apply(JPgBench bench, DataSource ds) {
-            final Connection c;
+            final Connection c; // NOPMD
             try {
                 c = ds.getConnection();
             } catch (SQLException e) {

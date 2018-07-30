@@ -18,7 +18,8 @@ public class TestJPgBench {
     @Test
     public void test() throws Exception {
         final JPgBench bench = new JPgBench();
-        bench.testDuration = Duration.ofSeconds(2);
+        bench.testDuration = Duration.ofSeconds(5);
+        bench.scale = 1;
         assertThat(bench.run(pg.getTestDatabase())).isGreaterThan(10);
     }
 }
