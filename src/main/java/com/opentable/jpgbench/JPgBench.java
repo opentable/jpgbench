@@ -154,13 +154,13 @@ public class JPgBench {
         LOG.info("Data created.  Running test of duration {}", testDuration);
 
         final AtomicLong start = new AtomicLong(-1);
-        final CountDownLatch startingGate = new CountDownLatch(1);
+        final CountDownLatch startingGate = new CountDownLatch(concurrency);
         final BenchOp bench = new BenchOp(this);
         final ExecutorService clientPool = new ThreadPoolExecutor(
                 concurrency, concurrency,
                 1, TimeUnit.DAYS,
                 new ArrayBlockingQueue<>(100),
-                new ThreadFactoryBuilder().setNameFormat("jdbi-client-%d").build());
+                new ThreadFactoryBuilder().setNameFormat("jpgbench-%d").build());
         for (int i = 0; i < concurrency; i++) {
             clientPool.submit(new Runnable() {
                 @Override
