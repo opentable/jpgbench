@@ -5,12 +5,15 @@ import static com.opentable.jpgbench.JPgBench.BID;
 import static com.opentable.jpgbench.JPgBench.DELTA;
 import static com.opentable.jpgbench.JPgBench.TID;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
@@ -67,6 +70,7 @@ public class JPgBench {
     final BenchMetrics metrics = new BenchMetrics(registry);
     long maxAid = 100_000, maxBid = 1, maxTid = 10;
 
+    final List<Closeable> closeables = new ArrayList<>();
 
     public static void main(String... args) throws Exception {
         if (new JPgBench().run(args) < 0) {
@@ -118,7 +122,7 @@ public class JPgBench {
         return run(this.connectStrategy.apply(this, ds));
     }
 
-    private void findPgpass(PGSimpleDataSource ds) throws IOException {
+    static void findPgpass(PGSimpleDataSource ds) throws IOException {
         Files.lines(Paths.get(System.getProperty("user.home"), ".pgpass"))
             .map(l -> StringUtils.split(l, ':'))
             .filter(p ->
@@ -178,13 +182,17 @@ public class JPgBench {
                     } catch (InterruptedException e) {
                         LOG.warn("while awaiting start", e);
                     }
-                    while (System.nanoTime() - start.get() < testDuration.toNanos()) {
+                    while (!clientPool.isShutdown()) {
                         Handle h = null;
                         try {
                             h = metrics.cxn.time(db::get);
                             final Handle lh = h;
                             metrics.txn.time(voidize(x -> bench.accept(lh)));
                         } catch (Exception e) {
+                            if (clientPool.isShutdown()) {
+                                LOG.trace("ignoring", e);
+                                return;
+                            }
                             failure = true;
                             LOG.warn("during test run", e);
                         } finally {
@@ -196,8 +204,12 @@ public class JPgBench {
                 }
             });
         }
+        while (!failure && (start.get() == -1 || System.nanoTime() - start.get() < testDuration.toNanos())) {
+            Thread.sleep(1000);
+        }
+        LOG.info("Shutting run down");
         clientPool.shutdown();
-        clientPool.awaitTermination(testDuration.toMillis() + 5_000, TimeUnit.MILLISECONDS);
+        clientPool.awaitTermination(5_000, TimeUnit.MILLISECONDS);
         final long end = System.nanoTime();
 
         final StringBuilder report = new StringBuilder(128);
@@ -210,6 +222,13 @@ public class JPgBench {
         final double tps = metrics.txn.getCount() / ((1.0d * end - start.get()) / TimeUnit.NANOSECONDS.convert(1, TimeUnit.SECONDS));
         report.append(String.format("tps=%.2f tpm=%.2f%n", tps, tps * 60));
         LOG.info("{}", report);
+        closeables.forEach(t -> {
+            try {
+                t.close();
+            } catch (IOException e) {
+                LOG.error("while closing {}", t, e);
+            }
+        });
         return failure ? -1 : metrics.txn.getCount();
     }
 
@@ -372,6 +391,7 @@ enum ConnectStrategy {
             config.setMaximumPoolSize(bench.concurrency);
 
             final HikariDataSource h = new HikariDataSource(config);
+            bench.closeables.add(h);
             return Jdbi.create(h)::open;
         }
     };
